@@ -1,0 +1,23 @@
+# Domains to redirect. Copy to domains.txt and edit.
+#
+# Format:  <apex-domain> [<target-url>]
+#
+# The target URL is optional. When omitted the domain uses --target (or
+# TARGET_URL from the config file). Blank lines and # comments are ignored.
+#
+# List APEX domains only — do NOT list www.*. The tool configures the apex and
+# www for each entry, and scopes the redirect rule to exactly those two
+# hostnames, so any other subdomain on the zone stays free for future use.
+
+# Simple case: everything goes to the default target.
+oldbrand.com
+oldbrand.net
+oldbrand.org
+
+# Typo-catchers.
+oldbrnad.com
+old-brand.com
+
+# Per-domain targets override the default.
+acquired-product.io      https://example.com/products/acquired
+summer-campaign.co       https://example.com/promo/summer

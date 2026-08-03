@@ -1,0 +1,13 @@
+# Real config and domain lists — commit only the .example files.
+# Your domain list is not secret, but it is yours, and keeping it out of the
+# repo means this can be shared without leaking your inventory.
+domains.txt
+cf-deploy-redirect.conf
+
+# Never commit a token. The tool wants one at mode 600 outside the repo
+# (~/.config/cloudflare/), but belt and braces.
+*token*
+*.token
+.env
+
+.DS_Store

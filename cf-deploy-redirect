@@ -1,0 +1,596 @@
+#!/usr/bin/env bash
+#
+# cf-deploy-redirect — configure Cloudflare zones to 301 to a destination URL.
+#
+# For redirect-only domains: brand variants, typo-catchers, acquired names,
+# retired products. Per zone it sets up a proxied placeholder A record at the
+# apex, a proxied CNAME at www, and a single host-scoped redirect rule.
+#
+# Idempotent and dry-run by default. Nothing is written without --apply.
+#
+# Usage:
+#   cf-deploy-redirect --target https://example.com/           # dry run
+#   cf-deploy-redirect --target https://example.com/ --apply
+#   cf-deploy-redirect --verify-only                           # no API calls
+#   cf-deploy-redirect --dump-rules                            # inspect existing rules
+#   cf-deploy-redirect --apply --replace-rules                 # overwrite foreign rules
+#
+# Options:
+#   --target URL         Default destination. Required unless every domain has
+#                        its own target, or TARGET_URL is set in the config file.
+#   --domains FILE       Domain list (default: ./domains.txt)
+#   --config FILE        Config file (default: ./cf-deploy-redirect.conf)
+#   --token-file PATH    Token file, mode 600 (default: ~/.config/cloudflare/cf-deploy-redirect-token)
+#   --status N           Redirect status: 301 or 302 (default: 301)
+#   --rule-ref REF       Ownership marker written into Cloudflare (default: cf_deploy_redirect)
+#   --cache-control VAL  Also set this Cache-Control on redirects, e.g. max-age=3600
+#   --placeholder-ip IP  Origin placeholder (default: 192.0.2.1, RFC 5737)
+#   --propagation-wait N Seconds to wait before verifying after --apply (default: 20)
+#   --apply              Actually write changes
+#   --replace-rules      Permit overwriting redirect rules this tool did not create
+#   --dump-rules         Print existing redirect rules, read-only
+#   --verify-only        Skip the API entirely; just check live behavior
+#   --no-verify          Skip the verification pass
+#   -h, --help           This text
+#
+# Token resolution, in order:
+#   1. $CLOUDFLARE_API_TOKEN
+#   2. --token-file PATH, or the default path if it exists (must be mode 600)
+#   3. interactive prompt (hidden input, never echoed, never stored)
+#
+# API token scopes required:
+#   Zone → Zone            Read
+#   Zone → DNS             Edit
+#   Zone → Single Redirect Edit
+#   Zone → Zone Settings   Edit
+#   Zone → Transform Rules Edit   (only with --cache-control)
+#
+# Requires: bash 3.2+, curl, jq. No other dependencies.
+
+set -euo pipefail
+
+API="https://api.cloudflare.com/client/v4"
+
+# ─── defaults (lowest precedence: flags > config file > these) ────────────────
+
+DEF_DOMAINS_FILE="./domains.txt"
+DEF_CONFIG_FILE="./cf-deploy-redirect.conf"
+DEF_TOKEN_FILE="${HOME}/.config/cloudflare/cf-deploy-redirect-token"
+DEF_STATUS=301
+DEF_RULE_REF="cf_deploy_redirect"
+DEF_PLACEHOLDER_IP="192.0.2.1"     # RFC 5737 documentation address; nothing is served from it
+DEF_PROPAGATION_WAIT=20
+
+# ─── flag parsing ────────────────────────────────────────────────────────────
+# Explicit flags land in FLAG_*; empty means "not given", so config can fill in.
+
+FLAG_TARGET=""; FLAG_DOMAINS_FILE=""; FLAG_TOKEN_FILE=""; FLAG_STATUS=""
+FLAG_RULE_REF=""; FLAG_CACHE_CONTROL=""; FLAG_PLACEHOLDER_IP=""; FLAG_PROPAGATION_WAIT=""
+CONFIG_FILE=""
+APPLY=0; VERIFY_ONLY=0; NO_VERIFY=0; DUMP_RULES=0; REPLACE_RULES=0; SET_CACHE_CONTROL=0
+CLI_DOMAINS=()
+
+usage() { awk 'NR>1 && /^#/ {sub(/^# ?/,""); print; next} NR>1 {exit}' "$0"; }
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --target)           FLAG_TARGET="${2:-}"; shift ;;
+    --domains)          FLAG_DOMAINS_FILE="${2:-}"; shift ;;
+    --config)           CONFIG_FILE="${2:-}"; shift ;;
+    --token-file)       FLAG_TOKEN_FILE="${2:-}"; shift ;;
+    --status)           FLAG_STATUS="${2:-}"; shift ;;
+    --rule-ref)         FLAG_RULE_REF="${2:-}"; shift ;;
+    --cache-control)    FLAG_CACHE_CONTROL="${2:-}"; SET_CACHE_CONTROL=1; shift ;;
+    --placeholder-ip)   FLAG_PLACEHOLDER_IP="${2:-}"; shift ;;
+    --propagation-wait) FLAG_PROPAGATION_WAIT="${2:-}"; shift ;;
+    --apply)            APPLY=1 ;;
+    --replace-rules)    REPLACE_RULES=1 ;;
+    --dump-rules)       DUMP_RULES=1 ;;
+    --verify-only)      VERIFY_ONLY=1 ;;
+    --no-verify)        NO_VERIFY=1 ;;
+    -h|--help)          usage; exit 0 ;;
+    -*)                 echo "unknown flag: $1 (try --help)" >&2; exit 2 ;;
+    *)                  CLI_DOMAINS[${#CLI_DOMAINS[@]}]="$1" ;;
+  esac
+  shift
+done
+
+# ─── config file ─────────────────────────────────────────────────────────────
+# Parsed as KEY=value, never sourced — a config file should not be able to
+# execute shell just because it has a stray backtick in it.
+
+CFG_TARGET=""; CFG_DOMAINS_FILE=""; CFG_TOKEN_FILE=""; CFG_STATUS=""
+CFG_RULE_REF=""; CFG_CACHE_CONTROL=""; CFG_PLACEHOLDER_IP=""; CFG_PROPAGATION_WAIT=""
+
+load_config() {
+  local file="$1" line key val
+  [[ -f $file ]] || return 0
+  while IFS= read -r line || [[ -n $line ]]; do
+    line="${line%%#*}"
+    line="$(printf '%s' "$line" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')"
+    [[ -z $line ]] && continue
+    case "$line" in *=*) ;; *) echo "warning: ignoring malformed config line: $line" >&2; continue ;; esac
+    key="$(printf '%s' "${line%%=*}" | tr -d '[:space:]')"
+    val="${line#*=}"
+    val="$(printf '%s' "$val" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')"
+    val="${val%\"}"; val="${val#\"}"; val="${val%\'}"; val="${val#\'}"
+    case "$key" in
+      TARGET_URL)       CFG_TARGET="$val" ;;
+      DOMAINS_FILE)     CFG_DOMAINS_FILE="$val" ;;
+      TOKEN_FILE)       CFG_TOKEN_FILE="$val" ;;
+      REDIRECT_STATUS)  CFG_STATUS="$val" ;;
+      RULE_REF)         CFG_RULE_REF="$val" ;;
+      CACHE_CONTROL)    CFG_CACHE_CONTROL="$val"; SET_CACHE_CONTROL=1 ;;
+      PLACEHOLDER_IP)   CFG_PLACEHOLDER_IP="$val" ;;
+      PROPAGATION_WAIT) CFG_PROPAGATION_WAIT="$val" ;;
+      *) echo "warning: unknown config key '$key' in $file" >&2 ;;
+    esac
+  done < "$file"
+}
+
+[[ -n $CONFIG_FILE ]] && { [[ -f $CONFIG_FILE ]] || { echo "config file not found: $CONFIG_FILE" >&2; exit 2; }; }
+load_config "${CONFIG_FILE:-$DEF_CONFIG_FILE}"
+
+# flags win over config, config wins over defaults.
+# Must always return 0: an all-empty candidate list is normal (e.g. no
+# --cache-control), and a non-zero return here would trip `set -e` at the
+# assignment before any validation could produce a useful message.
+pick() {
+  local v
+  for v in "$@"; do
+    if [[ -n $v ]]; then printf '%s' "$v"; return 0; fi
+  done
+  return 0
+}
+
+TARGET_URL="$(      pick "$FLAG_TARGET"           "$CFG_TARGET"           "")"
+DOMAINS_FILE="$(    pick "$FLAG_DOMAINS_FILE"     "$CFG_DOMAINS_FILE"     "$DEF_DOMAINS_FILE")"
+TOKEN_FILE="$(      pick "$FLAG_TOKEN_FILE"       "$CFG_TOKEN_FILE"       "$DEF_TOKEN_FILE")"
+REDIRECT_STATUS="$( pick "$FLAG_STATUS"           "$CFG_STATUS"           "$DEF_STATUS")"
+RULE_REF="$(        pick "$FLAG_RULE_REF"         "$CFG_RULE_REF"         "$DEF_RULE_REF")"
+CACHE_CONTROL="$(   pick "$FLAG_CACHE_CONTROL"    "$CFG_CACHE_CONTROL"    "")"
+PLACEHOLDER_IP="$(  pick "$FLAG_PLACEHOLDER_IP"   "$CFG_PLACEHOLDER_IP"   "$DEF_PLACEHOLDER_IP")"
+PROPAGATION_WAIT="$(pick "$FLAG_PROPAGATION_WAIT" "$CFG_PROPAGATION_WAIT" "$DEF_PROPAGATION_WAIT")"
+
+case "$REDIRECT_STATUS" in
+  301|302|307|308) ;;
+  *) echo "invalid --status '$REDIRECT_STATUS' (expected 301, 302, 307 or 308)" >&2; exit 2 ;;
+esac
+case "$RULE_REF" in
+  *[!a-zA-Z0-9_]*) echo "invalid --rule-ref '$RULE_REF' (letters, digits, underscore only)" >&2; exit 2 ;;
+esac
+
+# ─── domain list ─────────────────────────────────────────────────────────────
+# Parallel arrays rather than an associative array: macOS ships bash 3.2.
+# Line format:  <domain> [<target-url>]   — target optional, falls back to TARGET_URL.
+
+DOMAINS=(); TARGETS=()
+
+add_domain() {
+  DOMAINS[${#DOMAINS[@]}]="$1"
+  TARGETS[${#TARGETS[@]}]="${2:-}"
+}
+
+if [[ ${#CLI_DOMAINS[@]} -gt 0 ]]; then
+  for d in "${CLI_DOMAINS[@]}"; do add_domain "$d"; done
+else
+  [[ -f $DOMAINS_FILE ]] || { echo "no domains given and $DOMAINS_FILE not found" >&2; exit 2; }
+  while IFS= read -r line || [[ -n $line ]]; do
+    line="${line%%#*}"
+    set -- $line          # word-split on whitespace; $1=domain, $2=optional target
+    [[ $# -eq 0 ]] && continue
+    add_domain "$1" "${2:-}"
+  done < "$DOMAINS_FILE"
+fi
+[[ ${#DOMAINS[@]} -gt 0 ]] || { echo "domain list is empty" >&2; exit 2; }
+
+# Every domain needs a destination from somewhere.
+if [[ -z $TARGET_URL ]]; then
+  i=0
+  while [[ $i -lt ${#DOMAINS[@]} ]]; do
+    if [[ -z ${TARGETS[$i]} ]]; then
+      echo "no --target given and '${DOMAINS[$i]}' has no per-domain target" >&2
+      echo "  set --target, TARGET_URL in the config file, or a second column in $DOMAINS_FILE" >&2
+      exit 2
+    fi
+    i=$((i + 1))
+  done
+fi
+
+for tool in curl jq; do
+  command -v "$tool" >/dev/null || { echo "missing required tool: $tool" >&2; exit 2; }
+done
+
+# ─── output helpers ──────────────────────────────────────────────────────────
+
+if [[ -t 1 ]]; then
+  BOLD=$'\033[1m'; DIM=$'\033[2m'; RED=$'\033[31m'; GRN=$'\033[32m'; YEL=$'\033[33m'; RST=$'\033[0m'
+else
+  BOLD=""; DIM=""; RED=""; GRN=""; YEL=""; RST=""
+fi
+FAILED=0
+
+step() { printf '    %s %s ' "$1" "$(printf '%*s' $((22 - ${#1})) '' | tr ' ' '.')"; }
+ok()   { printf '%s%s%s\n' "$GRN" "$1" "$RST"; }
+warn() { printf '%s%s%s\n' "$YEL" "$1" "$RST"; }
+bad()  { printf '%s%s%s\n' "$RED" "$1" "$RST"; FAILED=1; }
+note() { printf '    %s%s%s\n' "$DIM" "$1" "$RST"; }
+
+# ─── API ─────────────────────────────────────────────────────────────────────
+
+# api METHOD PATH [JSON_BODY] → sets RESP_CODE, RESP_BODY
+#
+# The token is kept out of both the xtrace stream and the process argument list:
+# xtrace is suspended for the call, and the Authorization header goes to curl
+# via a config file on stdin rather than -H, so it never appears in `ps` output.
+api() {
+  local method="$1" path="$2" body="${3:-}" raw xtrace=0
+  case "$-" in *x*) xtrace=1; set +x ;; esac
+
+  local args
+  args=(-sS -K - -X "$method" -H "Content-Type: application/json" -w $'\n%{http_code}')
+  [[ -n $body ]] && args=("${args[@]}" --data-binary "$body")
+
+  if raw="$(printf 'header = "Authorization: Bearer %s"\n' "$CF_TOKEN" \
+            | curl "${args[@]}" "$API$path")"; then
+    RESP_CODE="${raw##*$'\n'}"
+    RESP_BODY="${raw%$'\n'*}"
+  else
+    RESP_CODE=000; RESP_BODY='{}'
+  fi
+
+  [[ $xtrace -eq 1 ]] && set -x
+  return 0
+}
+
+# Some Cloudflare errors carry no numeric code; don't render a bare "?:" prefix.
+api_err() {
+  jq -r '(.errors // [])[0] // {}
+         | (if .code then "\(.code): " else "" end)
+           + (.message // "unknown")
+           + (if .error_chain then " [" + ([.error_chain[].message] | join("; ")) + "]" else "" end)' \
+    <<<"$RESP_BODY" 2>/dev/null || echo "unparseable response"
+}
+
+# ─── auth ────────────────────────────────────────────────────────────────────
+
+CF_TOKEN=""
+if [[ $VERIFY_ONLY -eq 0 ]]; then
+  CF_TOKEN="${CLOUDFLARE_API_TOKEN:-}"
+
+  if [[ -z $CF_TOKEN && -f $TOKEN_FILE ]]; then
+    perms="$(stat -f '%OLp' "$TOKEN_FILE" 2>/dev/null || stat -c '%a' "$TOKEN_FILE" 2>/dev/null || echo '?')"
+    if [[ $perms != 600 ]]; then
+      echo "refusing to read $TOKEN_FILE: mode is $perms, expected 600" >&2
+      echo "  fix with: chmod 600 $TOKEN_FILE" >&2
+      exit 2
+    fi
+    IFS= read -r CF_TOKEN < "$TOKEN_FILE" || true
+    CF_TOKEN="$(printf '%s' "$CF_TOKEN" | tr -d '[:space:]')"
+  fi
+
+  if [[ -z $CF_TOKEN ]]; then
+    [[ -e /dev/tty ]] || { echo "no token available and no terminal to prompt on" >&2; exit 2; }
+    printf 'Cloudflare API token (input hidden): ' >&2
+    IFS= read -rs CF_TOKEN < /dev/tty; echo >&2
+  fi
+  [[ -n $CF_TOKEN ]] || { echo "no token provided" >&2; exit 2; }
+
+  api GET /user/tokens/verify
+  if [[ $RESP_CODE != 200 ]]; then
+    echo "${RED}token verification failed${RST} ($RESP_CODE) $(api_err)" >&2
+    exit 1
+  fi
+fi
+
+# ─── steps ───────────────────────────────────────────────────────────────────
+
+# Ensure a single proxied record of $want_type at $fqdn.
+#
+# A CNAME cannot coexist with A/AAAA at the same name (RFC 1034) and Cloudflare
+# enforces that, so any address-type record here that isn't the one we want is a
+# conflict to report rather than something to quietly work around. Both records
+# must stay proxied — a DNS-only record bypasses the redirect rule entirely.
+ensure_record() {
+  local zid="$1" fqdn="$2" label="$3" want_type="$4" want_content="$5"
+  local existing id content proxied conflict payload
+
+  api GET "/zones/$zid/dns_records?name=$fqdn"
+  if [[ $RESP_CODE != 200 ]]; then
+    step "$label"; bad "lookup failed ($RESP_CODE) $(api_err)"; return
+  fi
+  existing="$RESP_BODY"
+
+  conflict="$(jq -r --arg want "$want_type" '
+    [.result[]
+     | select(.type=="A" or .type=="AAAA" or .type=="CNAME")
+     | select(.type != $want) | .type] | unique | join(", ")' <<<"$existing")"
+  if [[ -n $conflict ]]; then
+    step "$label"; bad "unexpected $conflict record at $fqdn — remove it first"; return
+  fi
+
+  id="$(     jq -r --arg t "$want_type" '[.result[] | select(.type==$t)][0].id      // empty' <<<"$existing")"
+  content="$(jq -r --arg t "$want_type" '[.result[] | select(.type==$t)][0].content // empty' <<<"$existing")"
+  # `// false | tostring` rather than `// empty`: jq's alternative operator treats
+  # a literal false as absent, which would report an unproxied record as unknown.
+  proxied="$(jq -r --arg t "$want_type" '([.result[] | select(.type==$t)][0].proxied // false) | tostring' <<<"$existing")"
+  content="${content%.}"   # CNAME targets can come back with a trailing dot
+
+  step "$label"
+  if [[ $content == "$want_content" && $proxied == true ]]; then
+    ok "already correct"; return
+  fi
+
+  payload="$(jq -n --arg name "$fqdn" --arg type "$want_type" --arg content "$want_content" \
+    '{type:$type, name:$name, content:$content, proxied:true, ttl:1,
+      comment:"cf-deploy-redirect — edge intercepts, nothing served from origin"}')"
+
+  if [[ $APPLY -eq 0 ]]; then
+    if [[ -n $id ]]; then warn "would update ($content proxied=$proxied → $want_content proxied=true)"
+    else                  warn "would create ($want_type → $want_content, proxied)"; fi
+    return
+  fi
+
+  if [[ -n $id ]]; then
+    api PATCH "/zones/$zid/dns_records/$id" "$payload"
+  else
+    api POST "/zones/$zid/dns_records" "$payload"
+  fi
+  [[ $RESP_CODE == 200 ]] && ok "set" || bad "failed ($RESP_CODE) $(api_err)"
+}
+
+# Create-or-replace the dynamic redirect phase entrypoint.
+#
+# NOTE: PUT to a phase entrypoint replaces EVERY rule in that phase, so this
+# reads first and refuses any zone holding rules it did not create, unless
+# --replace-rules explicitly authorizes the overwrite.
+#
+# The body carries only `name` and `rules`: the entrypoint endpoint rejects
+# `kind` and `phase` (they are implied by the URL path) with
+# `400 invalid JSON: unknown field "kind"`. Those belong to POST /zones/{id}/rulesets.
+ensure_redirect_rule() {
+  local zid="$1" domain="$2" target="$3"
+  local foreign existing_refs payload replacing="" cur_target cur_status
+
+  api GET "/zones/$zid/rulesets/phases/http_request_dynamic_redirect/entrypoint"
+  step "redirect rule"
+
+  if [[ $RESP_CODE == 200 ]]; then
+    foreign="$(jq -r --arg ref "$RULE_REF" \
+      '[.result.rules // [] | .[] | select(.ref != $ref)] | length' <<<"$RESP_BODY")"
+    if [[ ${foreign:-0} -gt 0 ]]; then
+      existing_refs="$(jq -r --arg ref "$RULE_REF" \
+        '[.result.rules // [] | .[] | select(.ref != $ref) | (.description // .ref // "unnamed")] | join("; ")' <<<"$RESP_BODY")"
+      if [[ $REPLACE_RULES -eq 0 ]]; then
+        bad "refusing: zone has $foreign rule(s) this tool did not create → $existing_refs"
+        note "    inspect with --dump-rules; authorize overwrite with --replace-rules"
+        return
+      fi
+      replacing="$foreign existing: $existing_refs"
+    fi
+    cur_target="$(jq -r --arg ref "$RULE_REF" '[.result.rules[]? | select(.ref==$ref)][0].action_parameters.from_value.target_url.value // empty' <<<"$RESP_BODY")"
+    cur_status="$(jq -r --arg ref "$RULE_REF" '[.result.rules[]? | select(.ref==$ref)][0].action_parameters.from_value.status_code // empty' <<<"$RESP_BODY")"
+    if [[ -z $replacing && $cur_target == "$target" && $cur_status == "$REDIRECT_STATUS" ]]; then
+      ok "already correct"; return
+    fi
+  elif [[ $RESP_CODE != 404 ]]; then
+    bad "lookup failed ($RESP_CODE) $(api_err)"; return
+  fi
+
+  payload="$(jq -n \
+    --arg host "$domain" --arg wwwhost "www.$domain" \
+    --arg target "$target" --arg ref "$RULE_REF" \
+    --argjson status "$REDIRECT_STATUS" '
+    {
+      name: "default",
+      rules: [{
+        ref: $ref,
+        action: "redirect",
+        description: "cf-deploy-redirect → \($target)",
+        expression: ("http.host in {\"" + $host + "\" \"" + $wwwhost + "\"}"),
+        action_parameters: {
+          from_value: {
+            target_url: { value: $target },
+            status_code: $status,
+            preserve_query_string: true
+          }
+        }
+      }]
+    }')"
+
+  if [[ $APPLY -eq 0 ]]; then
+    if [[ -n $replacing ]]; then warn "would REPLACE $replacing → $REDIRECT_STATUS to $target"
+    else                         warn "would create ($REDIRECT_STATUS → $target)"; fi
+    return
+  fi
+  api PUT "/zones/$zid/rulesets/phases/http_request_dynamic_redirect/entrypoint" "$payload"
+  if [[ $RESP_CODE == 200 ]]; then
+    [[ -n $replacing ]] && ok "replaced ($REDIRECT_STATUS → $target)" || ok "set ($REDIRECT_STATUS → $target)"
+  else
+    bad "failed ($RESP_CODE) $(api_err)"
+  fi
+}
+
+# Bound how long browsers cache the redirect. A 301 with no Cache-Control is
+# heuristically cacheable indefinitely, which makes the hostname very hard to
+# reuse later. Response-header transforms DO apply to redirects generated by
+# the dynamic-redirect phase, on both http and https.
+ensure_cache_control() {
+  local zid="$1" payload foreign cur_cc
+  api GET "/zones/$zid/rulesets/phases/http_response_headers_transform/entrypoint"
+  step "cache-control"
+
+  if [[ $RESP_CODE == 200 ]]; then
+    foreign="$(jq -r --arg ref "$RULE_REF" '[.result.rules // [] | .[] | select(.ref != $ref)] | length' <<<"$RESP_BODY")"
+    if [[ ${foreign:-0} -gt 0 ]]; then
+      bad "refusing: zone has $foreign header-transform rule(s) this tool did not create"; return
+    fi
+    cur_cc="$(jq -r --arg ref "$RULE_REF" \
+      '[.result.rules[]? | select(.ref==$ref)][0].action_parameters.headers."Cache-Control".value // empty' <<<"$RESP_BODY")"
+    [[ $cur_cc == "$CACHE_CONTROL" ]] && { ok "already correct"; return; }
+  elif [[ $RESP_CODE != 404 ]]; then
+    bad "lookup failed ($RESP_CODE) $(api_err)"; return
+  fi
+
+  payload="$(jq -n --arg ref "$RULE_REF" --arg cc "$CACHE_CONTROL" '
+    {
+      name: "default",
+      rules: [{
+        ref: $ref, action: "rewrite", expression: "true",
+        description: "cf-deploy-redirect — bound browser caching of the redirect",
+        action_parameters: { headers: { "Cache-Control": { operation: "set", value: $cc } } }
+      }]
+    }')"
+
+  if [[ $APPLY -eq 0 ]]; then warn "would set ($CACHE_CONTROL)"; return; fi
+  api PUT "/zones/$zid/rulesets/phases/http_response_headers_transform/entrypoint" "$payload"
+  [[ $RESP_CODE == 200 ]] && ok "set ($CACHE_CONTROL)" || bad "failed ($RESP_CODE) $(api_err)"
+}
+
+# Always Use HTTPS fires BEFORE redirect rules, so leaving it on turns
+# http://vanity into two hops: 301 to https://vanity, then 301 to the target.
+# Off, the redirect rule catches plain HTTP directly. Nothing is served from
+# these hostnames, so there is no content to protect by forcing HTTPS first.
+ensure_setting_off() {
+  local zid="$1" setting="$2" label="$3" current
+  api GET "/zones/$zid/settings/$setting"
+  step "$label"
+  if [[ $RESP_CODE != 200 ]]; then bad "read failed ($RESP_CODE) $(api_err)"; return; fi
+  current="$(jq -r '.result.value // empty' <<<"$RESP_BODY")"
+  [[ $current == off ]] && { ok "already off"; return; }
+  if [[ $APPLY -eq 0 ]]; then warn "would set off (currently $current)"; return; fi
+  api PATCH "/zones/$zid/settings/$setting" '{"value":"off"}'
+  [[ $RESP_CODE == 200 ]] && ok "set off" || bad "failed ($RESP_CODE) $(api_err)"
+}
+
+# HSTS is reported, never changed: turning it off does not un-pin browsers that
+# already cached the policy, so it needs a human decision, not a script.
+check_hsts() {
+  local zid="$1" enabled max_age
+  api GET "/zones/$zid/settings/security_header"
+  step "hsts"
+  if [[ $RESP_CODE != 200 ]]; then printf '%s\n' "could not read"; return; fi
+  enabled="$(jq -r '.result.value.strict_transport_security.enabled // false' <<<"$RESP_BODY")"
+  max_age="$(jq -r '.result.value.strict_transport_security.max_age // 0' <<<"$RESP_BODY")"
+  [[ $enabled == true ]] && warn "ENABLED (max-age=$max_age) — review by hand" || ok "off"
+}
+
+# Read-only: print full existing redirect rules, so a --replace-rules decision
+# can be made against actual definitions rather than description strings.
+dump_rules() {
+  local zid="$1"
+  api GET "/zones/$zid/rulesets/phases/http_request_dynamic_redirect/entrypoint"
+  printf '    %sexisting redirect rules%s\n' "$DIM" "$RST"
+  if [[ $RESP_CODE == 404 ]]; then printf '      (none)\n'; return
+  elif [[ $RESP_CODE != 200 ]]; then step "dump"; bad "lookup failed ($RESP_CODE) $(api_err)"; return; fi
+  jq -r '.result.rules // [] | .[] |
+    "      • \(.description // .ref // "unnamed")\n" +
+    "        ref:         \(.ref // "(none)")\n" +
+    "        enabled:     \(.enabled)\n" +
+    "        expression:  \(.expression)\n" +
+    "        action:      \(.action)\n" +
+    "        target:      \(.action_parameters.from_value.target_url.value
+                           // .action_parameters.from_value.target_url.expression // "n/a")\n" +
+    "        status:      \(.action_parameters.from_value.status_code // "n/a")\n" +
+    "        preserve_qs: \(.action_parameters.from_value.preserve_query_string // false)"' <<<"$RESP_BODY"
+}
+
+# ─── verification ────────────────────────────────────────────────────────────
+
+verify_host() {
+  local url="$1" label="$2" want="$3" first hops final code loc cc walk
+
+  first="$(curl -sSI --max-time 10 "$url" 2>/dev/null)" || { step "$label"; bad "unreachable"; return; }
+
+  # `|| true` on every header grep: a missing header is a normal outcome, but
+  # under `set -o pipefail` grep's exit 1 would propagate and abort the script.
+  code="$(sed -n '1s#.* \([0-9][0-9][0-9]\).*#\1#p' <<<"$first" | head -1 || true)"
+  loc="$( grep -i '^location:'      <<<"$first" | head -1 | sed 's/^[Ll]ocation: *//'         | tr -d '\r' || true)"
+  cc="$(  grep -i '^cache-control:' <<<"$first" | head -1 | sed 's/^[Cc]ache-[Cc]ontrol: *//' | tr -d '\r' || true)"
+
+  # -w emits no trailing newline, so an `|| echo` fallback would get glued onto
+  # curl's own output. Branch on the exit status instead.
+  if walk="$(curl -sSL --max-time 20 -o /dev/null -w '%{num_redirects} %{url_effective}' "$url" 2>/dev/null)"; then
+    read -r hops final <<<"$walk"
+  else
+    hops="?"; final="(chain did not complete)"
+  fi
+
+  step "$label"
+  if [[ $code == "$REDIRECT_STATUS" && $final == "$want" && $hops == 1 ]]; then
+    ok "$code → $loc  [1 hop, cache-control: ${cc:-none}]"
+  else
+    bad "$code, $hops hop(s) → $final  [cache-control: ${cc:-none}]"
+  fi
+}
+
+# ─── main ────────────────────────────────────────────────────────────────────
+
+printf '\n%s%s%s' "$BOLD" "cf-deploy-redirect" "$RST"
+[[ -n $TARGET_URL ]] && printf '  →  %s' "$TARGET_URL"
+printf '\n'
+if [[ $VERIFY_ONLY -eq 1 ]]; then
+  printf '%sverify only — no API calls%s\n' "$DIM" "$RST"
+elif [[ $APPLY -eq 0 ]]; then
+  printf '%sDRY RUN — nothing will change. Re-run with --apply.%s\n' "$YEL" "$RST"
+fi
+
+if [[ $VERIFY_ONLY -eq 0 ]]; then
+  i=0
+  while [[ $i -lt ${#DOMAINS[@]} ]]; do
+    domain="${DOMAINS[$i]}"
+    target="${TARGETS[$i]}"; [[ -z $target ]] && target="$TARGET_URL"
+    i=$((i + 1))
+
+    printf '\n  %s%s%s' "$BOLD" "$domain" "$RST"
+    [[ $target != "$TARGET_URL" ]] && printf ' %s→ %s%s' "$DIM" "$target" "$RST"
+    printf '\n'
+
+    api GET "/zones?name=$domain"
+    step "zone"
+    if [[ $RESP_CODE != 200 ]]; then bad "lookup failed ($RESP_CODE) $(api_err)"; continue; fi
+    zone_id="$(jq -r '.result[0].id // empty' <<<"$RESP_BODY")"
+    zone_status="$(jq -r '.result[0].status // empty' <<<"$RESP_BODY")"
+    if [[ -z $zone_id ]]; then
+      bad "not found in this account — add and delegate it first"; continue
+    fi
+    [[ $zone_status == active ]] && ok "found (${zone_id:0:8}…)" \
+                                || warn "found (${zone_id:0:8}…) but status=$zone_status"
+
+    ensure_record "$zone_id" "$domain"     "A @"       A     "$PLACEHOLDER_IP"
+    ensure_record "$zone_id" "www.$domain" "CNAME www" CNAME "$domain"
+    [[ $DUMP_RULES -eq 1 ]] && dump_rules "$zone_id"
+    ensure_redirect_rule "$zone_id" "$domain" "$target"
+    [[ $SET_CACHE_CONTROL -eq 1 ]] && ensure_cache_control "$zone_id"
+    ensure_setting_off "$zone_id" always_use_https "always_use_https"
+    check_hsts "$zone_id"
+  done
+fi
+
+# Verification is a separate pass, after every write. Checking a zone immediately
+# after its own PUT races edge propagation and reports false failures — different
+# PoPs answer from different rule versions for a few seconds.
+if [[ $NO_VERIFY -eq 0 ]] && [[ $APPLY -eq 1 || $VERIFY_ONLY -eq 1 ]]; then
+  if [[ $APPLY -eq 1 ]]; then
+    printf '\n%swaiting %ss for rule propagation…%s\n' "$DIM" "$PROPAGATION_WAIT" "$RST"
+    sleep "$PROPAGATION_WAIT"
+  fi
+  printf '\n%sVerification%s\n' "$BOLD" "$RST"
+  i=0
+  while [[ $i -lt ${#DOMAINS[@]} ]]; do
+    domain="${DOMAINS[$i]}"
+    target="${TARGETS[$i]}"; [[ -z $target ]] && target="$TARGET_URL"
+    i=$((i + 1))
+    printf '\n  %s%s%s\n' "$BOLD" "$domain" "$RST"
+    verify_host "http://$domain/"      "http://@"    "$target"
+    verify_host "https://$domain/"     "https://@"   "$target"
+    verify_host "http://www.$domain/"  "http://www"  "$target"
+    verify_host "https://www.$domain/" "https://www" "$target"
+  done
+fi
+
+echo
+if [[ $FAILED -eq 1 ]]; then
+  printf '%sCompleted with problems — see red lines above.%s\n\n' "$RED" "$RST"; exit 1
+fi
+printf '%sAll good.%s\n\n' "$GRN" "$RST"

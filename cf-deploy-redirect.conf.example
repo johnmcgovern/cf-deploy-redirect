@@ -1,0 +1,43 @@
+# cf-deploy-redirect configuration. Copy to cf-deploy-redirect.conf and edit.
+#
+# Parsed as KEY=value — this file is never sourced, so it cannot execute shell.
+# Command-line flags override anything set here. Unknown keys produce a warning.
+#
+# Every setting is optional; the defaults shown are what the tool uses if the
+# key is absent. Only TARGET_URL is likely to be worth setting.
+
+# Default redirect destination. Domains without their own target in domains.txt
+# use this. Equivalent to --target.
+TARGET_URL=https://example.com/
+
+# Where the domain list lives. Equivalent to --domains.
+#DOMAINS_FILE=./domains.txt
+
+# API token file. Must be mode 600. Equivalent to --token-file.
+#TOKEN_FILE=~/.config/cloudflare/cf-deploy-redirect-token
+
+# 301 (permanent, consolidates SEO signals, cached hard by browsers) or
+# 302 (temporary, keeps the original canonical, not cached by default).
+# Use 302 if you might want these hostnames back for something else later.
+#REDIRECT_STATUS=301
+
+# Setting this enables the Cache-Control response-header rule, which bounds how
+# long browsers pin the redirect. Without it, a 301 is heuristically cacheable
+# forever and the hostname becomes very hard to repurpose. Requires the
+# Transform Rules → Edit token scope.
+#CACHE_CONTROL=max-age=3600
+
+# Ownership marker written into each Cloudflare rule. The tool uses it to
+# recognize its own rules on re-runs and to refuse zones holding rules it did
+# not create. Change it only if you are adopting rules created under a
+# different marker.
+#RULE_REF=cf_deploy_redirect
+
+# Origin placeholder for the apex A record. RFC 5737 reserves 192.0.2.0/24 for
+# documentation, so it is guaranteed unroutable — the edge intercepts before
+# any origin fetch is attempted.
+#PLACEHOLDER_IP=192.0.2.1
+
+# Seconds to wait after writing before verifying. Verifying immediately races
+# edge propagation and produces false failures.
+#PROPAGATION_WAIT=20
