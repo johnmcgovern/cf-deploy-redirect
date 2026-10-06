@@ -21,6 +21,13 @@ TARGET_URL=https://example.com/
 # Use 302 if you might want these hostnames back for something else later.
 #REDIRECT_STATUS=301
 
+# Keep the request path: /pricing?x=1 → <target origin>/pricing?x=1. Use it for
+# a retired or renamed site whose pages have equivalents at the target; leave it
+# off for brand variants and typo domains, which should land on the homepage.
+# Requires every target to be a bare origin (https://example.com/). Equivalent
+# to --preserve-path.
+#PRESERVE_PATH=false
+
 # Setting this enables the Cache-Control response-header rule, which bounds how
 # long browsers pin the redirect. Without it, a 301 is heuristically cacheable
 # forever and the hostname becomes very hard to repurpose. Requires the

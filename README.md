@@ -2,6 +2,8 @@
 
 Configure Cloudflare zones to redirect to a destination URL — correctly, idempotently, and with verification.
 
+This is the tool for redirect-only domains. For everything else on Cloudflare, use Cloudflare's `cf` CLI (the replacement for wrangler). This script deliberately uses neither: it calls the API directly with `curl` and `jq` and a narrowly scoped token file, so it has no CLI to keep in step with and nothing in it needs broad account access.
+
 For redirect-only domains: brand variants, typo-catchers, acquired names, retired products, anything you own defensively and want pointed at the real site. One command configures any number of zones and then proves the result over the wire.
 
 ```
@@ -55,7 +57,7 @@ Per zone:
 |---|---|---|
 | Apex `A` | `192.0.2.1`, proxied | RFC 5737 documentation address — guaranteed unroutable. The edge intercepts before any origin fetch, so nothing is ever served from it. |
 | `www` `CNAME` | the apex, proxied | One place to change the target. Publicly identical to an A record, since proxying means Cloudflare answers with its own IPs either way. |
-| Redirect rule | `301` to your target | Host-scoped to exactly the apex and `www` — see below. |
+| Redirect rule | `301` to your target | Host-scoped to exactly the apex and `www` — see below. Every path goes to the target as-is, unless `--preserve-path`. |
 | Always Use HTTPS | **off** | It fires *before* redirect rules, so leaving it on makes `http://` take two hops. Off, the redirect rule catches plain HTTP directly. Nothing is served from these hostnames, so there's no content to protect by forcing HTTPS first. |
 | `Cache-Control` | optional | Bounds how long browsers pin the redirect. See below. |
 | HSTS | **reported, never changed** | Disabling it doesn't un-pin browsers that already cached the policy. That's a human decision. |
@@ -71,6 +73,20 @@ http.host in {"oldbrand.com" "www.oldbrand.com"}
 rather than matching all requests. This matters more than it looks. A match-all rule redirects *any* subdomain you later add to that zone — and because browsers cache 301s indefinitely, it seeds permanently-cached redirects for the exact hostname you're trying to launch. Scoping the rule means `app.oldbrand.com` just works when you create it.
 
 For the same reason the tool creates only apex and `www` records, never a wildcard. Every other subdomain stays clean.
+
+### Preserving paths
+
+By default every request lands on the target URL exactly — `oldbrand.com/pricing` goes to `https://example.com/`. That's right for brand variants and typo domains, which never had pages of their own.
+
+For a **retired or renamed site** whose pages exist at the new address, use `--preserve-path` (or `PRESERVE_PATH=true`):
+
+```
+oldsite.com/pricing?ref=x  →  https://newsite.com/pricing?ref=x
+```
+
+The rule's target becomes an expression, `concat("https://newsite.com", http.request.uri.path)`, and the query string is kept as always. The target must be a bare origin — `https://newsite.com/`, no path or query — and the tool refuses anything else rather than build a URL with a doubled path. Verification adds a `path+query` check that requests a deep URL and confirms it arrives intact.
+
+The flag applies to every domain in the run. To mix modes, run the tool twice with different domain lists.
 
 ### Bounding the cache
 
@@ -127,6 +143,7 @@ In Cloudflare's account-owned token UI the permission groups are named `<Thing> 
 --config FILE         Config file (default: ./cf-deploy-redirect.conf)
 --token-file PATH     Token file, mode 600
 --status N            301, 302, 307 or 308 (default: 301)
+--preserve-path       Keep the request path; target must be a bare origin
 --rule-ref REF        Ownership marker (default: cf_deploy_redirect)
 --cache-control VAL   e.g. max-age=3600
 --placeholder-ip IP   Origin placeholder (default: 192.0.2.1)

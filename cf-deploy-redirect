@@ -21,7 +21,9 @@
 #   --domains FILE       Domain list (default: ./domains.txt)
 #   --config FILE        Config file (default: ./cf-deploy-redirect.conf)
 #   --token-file PATH    Token file, mode 600 (default: ~/.config/cloudflare/cf-deploy-redirect-token)
-#   --status N           Redirect status: 301 or 302 (default: 301)
+#   --status N           Redirect status: 301, 302, 307 or 308 (default: 301)
+#   --preserve-path      Keep the request path: /a/b → <target origin>/a/b.
+#                        Target must be a bare origin (https://example.com/).
 #   --rule-ref REF       Ownership marker written into Cloudflare (default: cf_deploy_redirect)
 #   --cache-control VAL  Also set this Cache-Control on redirects, e.g. max-age=3600
 #   --placeholder-ip IP  Origin placeholder (default: 192.0.2.1, RFC 5737)
@@ -66,6 +68,7 @@ DEF_PROPAGATION_WAIT=20
 
 FLAG_TARGET=""; FLAG_DOMAINS_FILE=""; FLAG_TOKEN_FILE=""; FLAG_STATUS=""
 FLAG_RULE_REF=""; FLAG_CACHE_CONTROL=""; FLAG_PLACEHOLDER_IP=""; FLAG_PROPAGATION_WAIT=""
+FLAG_PRESERVE_PATH=""
 CONFIG_FILE=""
 APPLY=0; VERIFY_ONLY=0; NO_VERIFY=0; DUMP_RULES=0; REPLACE_RULES=0; SET_CACHE_CONTROL=0
 CLI_DOMAINS=()
@@ -83,6 +86,7 @@ while [[ $# -gt 0 ]]; do
     --cache-control)    FLAG_CACHE_CONTROL="${2:-}"; SET_CACHE_CONTROL=1; shift ;;
     --placeholder-ip)   FLAG_PLACEHOLDER_IP="${2:-}"; shift ;;
     --propagation-wait) FLAG_PROPAGATION_WAIT="${2:-}"; shift ;;
+    --preserve-path)    FLAG_PRESERVE_PATH=1 ;;
     --apply)            APPLY=1 ;;
     --replace-rules)    REPLACE_RULES=1 ;;
     --dump-rules)       DUMP_RULES=1 ;;
@@ -101,6 +105,7 @@ done
 
 CFG_TARGET=""; CFG_DOMAINS_FILE=""; CFG_TOKEN_FILE=""; CFG_STATUS=""
 CFG_RULE_REF=""; CFG_CACHE_CONTROL=""; CFG_PLACEHOLDER_IP=""; CFG_PROPAGATION_WAIT=""
+CFG_PRESERVE_PATH=""
 
 load_config() {
   local file="$1" line key val
@@ -123,6 +128,7 @@ load_config() {
       CACHE_CONTROL)    CFG_CACHE_CONTROL="$val"; SET_CACHE_CONTROL=1 ;;
       PLACEHOLDER_IP)   CFG_PLACEHOLDER_IP="$val" ;;
       PROPAGATION_WAIT) CFG_PROPAGATION_WAIT="$val" ;;
+      PRESERVE_PATH)    CFG_PRESERVE_PATH="$val" ;;
       *) echo "warning: unknown config key '$key' in $file" >&2 ;;
     esac
   done < "$file"
@@ -151,10 +157,16 @@ RULE_REF="$(        pick "$FLAG_RULE_REF"         "$CFG_RULE_REF"         "$DEF_
 CACHE_CONTROL="$(   pick "$FLAG_CACHE_CONTROL"    "$CFG_CACHE_CONTROL"    "")"
 PLACEHOLDER_IP="$(  pick "$FLAG_PLACEHOLDER_IP"   "$CFG_PLACEHOLDER_IP"   "$DEF_PLACEHOLDER_IP")"
 PROPAGATION_WAIT="$(pick "$FLAG_PROPAGATION_WAIT" "$CFG_PROPAGATION_WAIT" "$DEF_PROPAGATION_WAIT")"
+PRESERVE_PATH="$(   pick "$FLAG_PRESERVE_PATH"    "$CFG_PRESERVE_PATH"    "0")"
 
 case "$REDIRECT_STATUS" in
   301|302|307|308) ;;
   *) echo "invalid --status '$REDIRECT_STATUS' (expected 301, 302, 307 or 308)" >&2; exit 2 ;;
+esac
+case "$PRESERVE_PATH" in
+  1|true|yes)  PRESERVE_PATH=1 ;;
+  0|false|no)  PRESERVE_PATH=0 ;;
+  *) echo "invalid PRESERVE_PATH '$PRESERVE_PATH' (expected true or false)" >&2; exit 2 ;;
 esac
 case "$RULE_REF" in
   *[!a-zA-Z0-9_]*) echo "invalid --rule-ref '$RULE_REF' (letters, digits, underscore only)" >&2; exit 2 ;;
@@ -191,6 +203,22 @@ if [[ -z $TARGET_URL ]]; then
     if [[ -z ${TARGETS[$i]} ]]; then
       echo "no --target given and '${DOMAINS[$i]}' has no per-domain target" >&2
       echo "  set --target, TARGET_URL in the config file, or a second column in $DOMAINS_FILE" >&2
+      exit 2
+    fi
+    i=$((i + 1))
+  done
+fi
+
+# Path preservation appends the request path to the target, so the target must
+# be a bare origin: a path or query would be duplicated or mangled. The origin is
+# also spliced into a rule expression string, which rules out quotes by regex.
+ORIGIN_RE='^https?://[A-Za-z0-9.-]+(:[0-9]+)?/?$'
+if [[ $PRESERVE_PATH -eq 1 ]]; then
+  i=0
+  while [[ $i -lt ${#DOMAINS[@]} ]]; do
+    t="${TARGETS[$i]}"; [[ -z $t ]] && t="$TARGET_URL"
+    if ! [[ $t =~ $ORIGIN_RE ]]; then
+      echo "--preserve-path needs a bare origin target; '${DOMAINS[$i]}' → '$t' has a path or query" >&2
       exit 2
     fi
     i=$((i + 1))
@@ -350,7 +378,16 @@ ensure_record() {
 # `400 invalid JSON: unknown field "kind"`. Those belong to POST /zones/{id}/rulesets.
 ensure_redirect_rule() {
   local zid="$1" domain="$2" target="$3"
-  local foreign existing_refs payload replacing="" cur_target cur_status
+  local foreign existing_refs payload replacing="" cur_target="" cur_status=""
+  local origin want_target label
+  origin="${target%/}"
+  if [[ $PRESERVE_PATH -eq 1 ]]; then
+    want_target="concat(\"$origin\", http.request.uri.path)"
+    label="$origin/*"
+  else
+    want_target="$target"
+    label="$target"
+  fi
 
   api GET "/zones/$zid/rulesets/phases/http_request_dynamic_redirect/entrypoint"
   step "redirect rule"
@@ -368,9 +405,9 @@ ensure_redirect_rule() {
       fi
       replacing="$foreign existing: $existing_refs"
     fi
-    cur_target="$(jq -r --arg ref "$RULE_REF" '[.result.rules[]? | select(.ref==$ref)][0].action_parameters.from_value.target_url.value // empty' <<<"$RESP_BODY")"
+    cur_target="$(jq -r --arg ref "$RULE_REF" '[.result.rules[]? | select(.ref==$ref)][0].action_parameters.from_value.target_url | (.value // .expression) // empty' <<<"$RESP_BODY")"
     cur_status="$(jq -r --arg ref "$RULE_REF" '[.result.rules[]? | select(.ref==$ref)][0].action_parameters.from_value.status_code // empty' <<<"$RESP_BODY")"
-    if [[ -z $replacing && $cur_target == "$target" && $cur_status == "$REDIRECT_STATUS" ]]; then
+    if [[ -z $replacing && $cur_target == "$want_target" && $cur_status == "$REDIRECT_STATUS" ]]; then
       ok "already correct"; return
     fi
   elif [[ $RESP_CODE != 404 ]]; then
@@ -379,18 +416,18 @@ ensure_redirect_rule() {
 
   payload="$(jq -n \
     --arg host "$domain" --arg wwwhost "www.$domain" \
-    --arg target "$target" --arg ref "$RULE_REF" \
-    --argjson status "$REDIRECT_STATUS" '
+    --arg target "$want_target" --arg label "$label" --arg ref "$RULE_REF" \
+    --argjson status "$REDIRECT_STATUS" --argjson expr "$PRESERVE_PATH" '
     {
       name: "default",
       rules: [{
         ref: $ref,
         action: "redirect",
-        description: "cf-deploy-redirect → \($target)",
+        description: "cf-deploy-redirect → \($label)",
         expression: ("http.host in {\"" + $host + "\" \"" + $wwwhost + "\"}"),
         action_parameters: {
           from_value: {
-            target_url: { value: $target },
+            target_url: (if $expr == 1 then { expression: $target } else { value: $target } end),
             status_code: $status,
             preserve_query_string: true
           }
@@ -399,13 +436,14 @@ ensure_redirect_rule() {
     }')"
 
   if [[ $APPLY -eq 0 ]]; then
-    if [[ -n $replacing ]]; then warn "would REPLACE $replacing → $REDIRECT_STATUS to $target"
-    else                         warn "would create ($REDIRECT_STATUS → $target)"; fi
+    if [[ -n $replacing ]]; then warn "would REPLACE $replacing → $REDIRECT_STATUS to $label"
+    elif [[ -n $cur_target ]]; then warn "would update ($REDIRECT_STATUS → $label)"
+    else                         warn "would create ($REDIRECT_STATUS → $label)"; fi
     return
   fi
   api PUT "/zones/$zid/rulesets/phases/http_request_dynamic_redirect/entrypoint" "$payload"
   if [[ $RESP_CODE == 200 ]]; then
-    [[ -n $replacing ]] && ok "replaced ($REDIRECT_STATUS → $target)" || ok "set ($REDIRECT_STATUS → $target)"
+    [[ -n $replacing ]] && ok "replaced ($REDIRECT_STATUS → $label)" || ok "set ($REDIRECT_STATUS → $label)"
   else
     bad "failed ($RESP_CODE) $(api_err)"
   fi
@@ -497,6 +535,9 @@ dump_rules() {
 
 # ─── verification ────────────────────────────────────────────────────────────
 
+# Deliberately nonexistent at the target; only the redirect's Location matters.
+PROBE_PATH="cf-deploy-redirect/probe?check=1"
+
 verify_host() {
   local url="$1" label="$2" want="$3" first hops final code loc cc walk
 
@@ -582,10 +623,17 @@ if [[ $NO_VERIFY -eq 0 ]] && [[ $APPLY -eq 1 || $VERIFY_ONLY -eq 1 ]]; then
     target="${TARGETS[$i]}"; [[ -z $target ]] && target="$TARGET_URL"
     i=$((i + 1))
     printf '\n  %s%s%s\n' "$BOLD" "$domain" "$RST"
+    # With path preservation, "/" maps to the origin's "/", and a deep path must
+    # arrive intact (query included) — the probe proves the rule isn't a plain
+    # value redirect that drops it.
+    [[ $PRESERVE_PATH -eq 1 ]] && target="${target%/}/"
     verify_host "http://$domain/"      "http://@"    "$target"
     verify_host "https://$domain/"     "https://@"   "$target"
     verify_host "http://www.$domain/"  "http://www"  "$target"
     verify_host "https://www.$domain/" "https://www" "$target"
+    if [[ $PRESERVE_PATH -eq 1 ]]; then
+      verify_host "https://www.$domain/$PROBE_PATH" "path+query" "${target}$PROBE_PATH"
+    fi
   done
 fi
 
