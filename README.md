@@ -142,6 +142,7 @@ In Cloudflare's account-owned token UI the permission groups are named `<Thing> 
 --domains FILE        Domain list (default: ./domains.txt)
 --config FILE         Config file (default: ./cf-deploy-redirect.conf)
 --token-file PATH     Token file, mode 600
+--account ID          Only use zones in this account
 --status N            301, 302, 307 or 308 (default: 301)
 --preserve-path       Keep the request path; target must be a bare origin
 --rule-ref REF        Ownership marker (default: cf_deploy_redirect)
@@ -157,6 +158,8 @@ In Cloudflare's account-owned token UI the permission groups are named `<Thing> 
 ```
 
 Precedence: flags → config file → built-in defaults.
+
+If the token can see more than one account, a zone being moved between them exists in both for a while, the old copy with status `moved`. The tool refuses to guess which one you mean and asks for `--account` (or `ACCOUNT_ID` in the config). The ID is in the dashboard's URL, or comes from `GET /accounts`.
 
 Domains can also be passed as arguments, which overrides the domain file entirely:
 

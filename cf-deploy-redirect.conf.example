@@ -16,6 +16,11 @@ TARGET_URL=https://example.com/
 # API token file. Must be mode 600. Equivalent to --token-file.
 #TOKEN_FILE=~/.config/cloudflare/cf-deploy-redirect-token
 
+# Only use zones in this Cloudflare account. Needed when the token sees the
+# same zone name in more than one account, e.g. during a move between them.
+# Equivalent to --account.
+#ACCOUNT_ID=
+
 # 301 (permanent, consolidates SEO signals, cached hard by browsers) or
 # 302 (temporary, keeps the original canonical, not cached by default).
 # Use 302 if you might want these hostnames back for something else later.

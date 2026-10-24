@@ -21,6 +21,8 @@
 #   --domains FILE       Domain list (default: ./domains.txt)
 #   --config FILE        Config file (default: ./cf-deploy-redirect.conf)
 #   --token-file PATH    Token file, mode 600 (default: ~/.config/cloudflare/cf-deploy-redirect-token)
+#   --account ID         Only use zones in this account. Needed when the token
+#                        sees the same zone name in more than one account.
 #   --status N           Redirect status: 301, 302, 307 or 308 (default: 301)
 #   --preserve-path      Keep the request path: /a/b → <target origin>/a/b.
 #                        Target must be a bare origin (https://example.com/).
@@ -68,7 +70,7 @@ DEF_PROPAGATION_WAIT=20
 
 FLAG_TARGET=""; FLAG_DOMAINS_FILE=""; FLAG_TOKEN_FILE=""; FLAG_STATUS=""
 FLAG_RULE_REF=""; FLAG_CACHE_CONTROL=""; FLAG_PLACEHOLDER_IP=""; FLAG_PROPAGATION_WAIT=""
-FLAG_PRESERVE_PATH=""
+FLAG_PRESERVE_PATH=""; FLAG_ACCOUNT_ID=""
 CONFIG_FILE=""
 APPLY=0; VERIFY_ONLY=0; NO_VERIFY=0; DUMP_RULES=0; REPLACE_RULES=0; SET_CACHE_CONTROL=0
 CLI_DOMAINS=()
@@ -81,6 +83,7 @@ while [[ $# -gt 0 ]]; do
     --domains)          FLAG_DOMAINS_FILE="${2:-}"; shift ;;
     --config)           CONFIG_FILE="${2:-}"; shift ;;
     --token-file)       FLAG_TOKEN_FILE="${2:-}"; shift ;;
+    --account)          FLAG_ACCOUNT_ID="${2:-}"; shift ;;
     --status)           FLAG_STATUS="${2:-}"; shift ;;
     --rule-ref)         FLAG_RULE_REF="${2:-}"; shift ;;
     --cache-control)    FLAG_CACHE_CONTROL="${2:-}"; SET_CACHE_CONTROL=1; shift ;;
@@ -105,7 +108,7 @@ done
 
 CFG_TARGET=""; CFG_DOMAINS_FILE=""; CFG_TOKEN_FILE=""; CFG_STATUS=""
 CFG_RULE_REF=""; CFG_CACHE_CONTROL=""; CFG_PLACEHOLDER_IP=""; CFG_PROPAGATION_WAIT=""
-CFG_PRESERVE_PATH=""
+CFG_PRESERVE_PATH=""; CFG_ACCOUNT_ID=""
 
 load_config() {
   local file="$1" line key val
@@ -129,6 +132,7 @@ load_config() {
       PLACEHOLDER_IP)   CFG_PLACEHOLDER_IP="$val" ;;
       PROPAGATION_WAIT) CFG_PROPAGATION_WAIT="$val" ;;
       PRESERVE_PATH)    CFG_PRESERVE_PATH="$val" ;;
+      ACCOUNT_ID)       CFG_ACCOUNT_ID="$val" ;;
       *) echo "warning: unknown config key '$key' in $file" >&2 ;;
     esac
   done < "$file"
@@ -158,6 +162,7 @@ CACHE_CONTROL="$(   pick "$FLAG_CACHE_CONTROL"    "$CFG_CACHE_CONTROL"    "")"
 PLACEHOLDER_IP="$(  pick "$FLAG_PLACEHOLDER_IP"   "$CFG_PLACEHOLDER_IP"   "$DEF_PLACEHOLDER_IP")"
 PROPAGATION_WAIT="$(pick "$FLAG_PROPAGATION_WAIT" "$CFG_PROPAGATION_WAIT" "$DEF_PROPAGATION_WAIT")"
 PRESERVE_PATH="$(   pick "$FLAG_PRESERVE_PATH"    "$CFG_PRESERVE_PATH"    "0")"
+ACCOUNT_ID="$(      pick "$FLAG_ACCOUNT_ID"       "$CFG_ACCOUNT_ID"       "")"
 
 case "$REDIRECT_STATUS" in
   301|302|307|308) ;;
@@ -167,6 +172,9 @@ case "$PRESERVE_PATH" in
   1|true|yes)  PRESERVE_PATH=1 ;;
   0|false|no)  PRESERVE_PATH=0 ;;
   *) echo "invalid PRESERVE_PATH '$PRESERVE_PATH' (expected true or false)" >&2; exit 2 ;;
+esac
+case "$ACCOUNT_ID" in
+  *[!a-f0-9]*) echo "invalid --account '$ACCOUNT_ID' (expected a 32-character hex account ID)" >&2; exit 2 ;;
 esac
 case "$RULE_REF" in
   *[!a-zA-Z0-9_]*) echo "invalid --rule-ref '$RULE_REF' (letters, digits, underscore only)" >&2; exit 2 ;;
@@ -587,9 +595,13 @@ if [[ $VERIFY_ONLY -eq 0 ]]; then
     [[ $target != "$TARGET_URL" ]] && printf ' %s→ %s%s' "$DIM" "$target" "$RST"
     printf '\n'
 
-    api GET "/zones?name=$domain"
+    api GET "/zones?name=$domain${ACCOUNT_ID:+&account.id=$ACCOUNT_ID}"
     step "zone"
     if [[ $RESP_CODE != 200 ]]; then bad "lookup failed ($RESP_CODE) $(api_err)"; continue; fi
+    # A zone mid-move between accounts exists in both; never guess which one.
+    if [[ $(jq '.result | length' <<<"$RESP_BODY") -gt 1 ]]; then
+      bad "in more than one account ($(jq -r '[.result[].account.name] | join(", ")' <<<"$RESP_BODY")) — pick one with --account"; continue
+    fi
     zone_id="$(jq -r '.result[0].id // empty' <<<"$RESP_BODY")"
     zone_status="$(jq -r '.result[0].status // empty' <<<"$RESP_BODY")"
     if [[ -z $zone_id ]]; then
